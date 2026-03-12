@@ -1,0 +1,166 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users
+    // Document ID: {userId}
+    // Fields:
+    //   - uid: string (required, immutable) - The user's UID
+    //   - email: string (required, immutable) - The user's email
+    //   - displayName: string (optional) - The user's display name
+    //   - photoURL: string (optional) - The user's photo URL
+    //   - role: string (required) - 'admin' or 'user'
+    //   - createdAt: timestamp (required, immutable) - The time the user was created
+    //
+    // Collection: creatives
+    // Document ID: {creativeId}
+    // Fields:
+    //   - userId: string (required, immutable) - The UID of the user who generated this
+    //   - imageUrl: string (required) - The URL of the generated image
+    //   - headline: string (required) - The headline
+    //   - body: string (required) - The body text
+    //   - createdAt: timestamp (required, immutable) - The time the creative was generated
+    //
+    // Collection: settings
+    // Document ID: {settingId}
+    // Fields:
+    //   - siteName: string (required) - The name of the site
+    //   - maintenanceMode: boolean (required) - Whether the site is in maintenance mode
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && (
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin') ||
+        (request.auth.token.email == "antoniokamota06@gmail.com" && request.auth.token.email_verified == true)
+      );
+    }
+
+    function uidUnchanged() {
+      return !('uid' in request.resource.data) || request.resource.data.uid == request.auth.uid;
+    }
+
+    function uidNotModified() {
+      return !('uid' in request.resource.data) || request.resource.data.uid == resource.data.uid;
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    function isValidEmail(email) {
+      return email is string && email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    function isValidUrl(url) {
+      return url is string && (url.matches("^https://.*") || url.matches("^http://.*") || url.matches("^data:image/.*"));
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    function isValidUser(data) {
+      return hasOnlyAllowedFields(['uid', 'email', 'displayName', 'photoURL', 'role', 'createdAt']) &&
+             data.uid is string && data.uid.size() > 0 && data.uid.size() < 100 &&
+             data.email is string && isValidEmail(data.email) && data.email.size() < 150 &&
+             (!('displayName' in data) || (data.displayName is string && data.displayName.size() < 100)) &&
+             (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() < 1000)) &&
+             data.role in ['admin', 'user'] &&
+             data.createdAt is timestamp;
+    }
+
+    function isValidCreative(data) {
+      return hasOnlyAllowedFields(['userId', 'imageUrl', 'headline', 'body', 'createdAt']) &&
+             data.userId is string && data.userId.size() > 0 && data.userId.size() < 100 &&
+             data.imageUrl is string && isValidUrl(data.imageUrl) && data.imageUrl.size() < 5000000 && // allow base64
+             data.headline is string && data.headline.size() < 500 &&
+             data.body is string && data.body.size() < 5000 &&
+             data.createdAt is timestamp;
+    }
+
+    function isValidSettings(data) {
+      return hasOnlyAllowedFields(['siteName', 'maintenanceMode']) &&
+             data.siteName is string && data.siteName.size() > 0 && data.siteName.size() < 100 &&
+             data.maintenanceMode is bool;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{userId} {
+      // Users can read their own profile. Admins can read all profiles.
+      allow read: if isOwner(userId) || isAdmin();
+      
+      // Users can create their own profile. They can only set role to 'user' unless they are an admin.
+      allow create: if isAuthenticated() && 
+                    isOwner(userId) && 
+                    isValidUser(request.resource.data) && 
+                    uidUnchanged() &&
+                    ((request.resource.data.role == 'user') || isAdmin());
+                    
+      // Users can update their own profile, but cannot change their role or uid or email or createdAt. Admins can update any profile.
+      allow update: if isAuthenticated() && 
+                    isValidUser(request.resource.data) && 
+                    (
+                      (isOwner(userId) && areImmutableFieldsUnchanged(['uid', 'email', 'role', 'createdAt'])) || 
+                      (isAdmin() && areImmutableFieldsUnchanged(['uid', 'email', 'createdAt']))
+                    );
+                    
+      // Only admins can delete users
+      allow delete: if isAdmin();
+    }
+
+    match /creatives/{creativeId} {
+      // Users can read their own creatives. Admins can read all creatives.
+      allow read: if isAuthenticated() && (request.auth.uid == resource.data.userId || isAdmin());
+      
+      // Users can create creatives for themselves.
+      allow create: if isAuthenticated() && 
+                    isValidCreative(request.resource.data) && 
+                    request.resource.data.userId == request.auth.uid;
+                    
+      // Users can update their own creatives (e.g., editing copy). Admins can update any creative.
+      allow update: if isAuthenticated() && 
+                    isValidCreative(request.resource.data) && 
+                    areImmutableFieldsUnchanged(['userId', 'createdAt']) &&
+                    (request.auth.uid == resource.data.userId || isAdmin());
+                    
+      // Users can delete their own creatives. Admins can delete any creative.
+      allow delete: if isAuthenticated() && (request.auth.uid == resource.data.userId || isAdmin());
+    }
+
+    match /settings/{settingId} {
+      // Anyone authenticated can read settings (e.g., to check maintenance mode)
+      allow read: if isAuthenticated();
+      
+      // Only admins can create/update/delete settings
+      allow create, update, delete: if isAdmin() && isValidSettings(request.resource.data);
+    }
+  }
+}
